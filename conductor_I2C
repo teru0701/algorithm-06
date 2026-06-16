@@ -1,0 +1,136 @@
+//指揮者側I2C
+
+#include <Wire.h>
+
+// ---- 楽器のI2Cアドレス（楽器側のMY_ADDRESSと一致させること）----
+const int NUM_INSTRUMENTS = 4;
+const uint8_t addrInstrument[4] = {0x10, 0x20, 0x30, 0x40};  // 楽器1〜4
+
+// ---- 荷重センサ計測用 ----
+const int SENSOR_PIN = A0;
+unsigned long t1 = 0, t2 = 0;
+int detectCount = 0;
+bool isSensorPressed = false;
+int currentBPM = 120;
+int currentBarCount = 0;
+
+bool isSystemPlaying = false;
+unsigned long playStartTime = 0;
+
+// 荷重センサで通過時間を計測
+unsigned long measureTmeas(int sensorPin) {
+  int sensorState = analogRead(sensorPin);
+  if (sensorState > 150 && !isSensorPressed) {
+    unsigned long now = millis();
+    isSensorPressed = true;
+    detectCount++;
+    if (detectCount == 1) {
+      t1 = now;
+      Serial.print("【1回目】 t1 = "); Serial.println(t1);
+    } else if (detectCount == 2) {
+      t2 = now;
+      Serial.print("【2回目】 t2 = "); Serial.println(t2);
+      detectCount = 0;
+      return t2 - t1;
+    }
+  } else if (sensorState <= 150 && isSensorPressed) {
+    isSensorPressed = false;
+  }
+  return 0;
+}
+
+int lookupBPM(unsigned long Tmeas) {
+  const int EDGE_COUNT = 8;
+  unsigned long thresholds[EDGE_COUNT] = {515, 876, 1236, 1597, 1958, 2318, 2679, 3039};
+  int bpmTable[EDGE_COUNT + 1] = {240, 215, 190, 165, 140, 115, 90, 65, 40};
+  for (int i = 0; i < EDGE_COUNT; i++) {
+    if (Tmeas < thresholds[i]) return bpmTable[i];
+  }
+  return bpmTable[EDGE_COUNT];
+}
+
+// I2Cで1台の楽器へ送信
+void sendPacket(uint8_t addr, int bpm) {
+  uint8_t packet[3];
+  packet[0] = 0xAA;
+  packet[1] = (uint8_t)bpm;
+  packet[2] = packet[0] ^ packet[1];
+
+  Wire.beginTransmission(addr);
+  Wire.write(packet, 3);
+  byte result = Wire.endTransmission();   // 0=成功
+
+  Serial.print("addr 0x");
+  Serial.print(addr, HEX);
+  Serial.print(" へ送信: ");
+  Serial.println(result == 0 ? "成功" : "失敗");
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();              // I2Cマスタとして起動
+  pinMode(SENSOR_PIN, INPUT);
+  Serial.println("=== 輪唱システム 指揮者（I2C・荷重センサ版）===");
+  Serial.println("車両がセンサを通過するのを待機中...");
+}
+
+void loop() {
+  // 演奏前の場合
+  if (!isSystemPlaying) {
+    unsigned long tmeas = measureTmeas(SENSOR_PIN);
+    if (tmeas > 0) {
+      int bpm = lookupBPM(tmeas);
+
+      Serial.print("Tmeas="); Serial.print(tmeas);
+      Serial.print(" → 初期BPM="); Serial.println(bpm);
+
+      currentBPM = bpm;
+      isSystemPlaying = true;
+      playStartTime = millis();
+      currentBarCount = 0;
+    }
+
+  // 演奏中の場合
+  } else {
+    unsigned long tmeas = measureTmeas(SENSOR_PIN);
+    if (tmeas > 0) {
+      currentBPM = lookupBPM(tmeas);
+      Serial.print("★車両通過！BPMを更新しました -> ");
+      Serial.println(currentBPM);
+    }
+
+    currentBarCount++;
+    
+    Serial.print("【リアルタイム更新】小節: ");
+    Serial.print(currentBarCount);
+    Serial.print(" / 送信BPM: ");
+    Serial.println(currentBPM);
+
+    uint8_t packet[3];
+    packet[1] = (uint8_t)currentBPM;
+
+    for (int partID = 0; partID < NUM_INSTRUMENTS; partID++) {
+      int startBar = (partID * 2) + 1;
+      
+      if (currentBarCount >= startBar) {
+        packet[0] = (currentBarCount == startBar) ? 0xAA : 0xBB;
+        packet[2] = packet[0] ^ packet[1];
+
+        Wire.beginTransmission(addrInstrument[partID]);
+        Wire.write(packet, 3);
+        Wire.endTransmission();
+      }
+    }
+
+    if (millis() - playStartTime > 120000UL) {
+      isSystemPlaying = false;
+      currentBarCount = 0;
+      Serial.println("演奏終了・再受付");
+      Serial.println("次の車両を待機中...");
+      return;
+    }
+
+    unsigned long bar_ms = (unsigned long)((60.0 / currentBPM) * 4.0 * 1000.0);
+    delay(bar_ms);
+  }
+}
